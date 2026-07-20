@@ -81,11 +81,13 @@ def generate_drug_data(
     mol_graph,
     atom_symbols,
     fps_all,
-    id,
+    drug_id,
+    canonical_smiles,
     self_idx=None,
     topk=32,
-    tau_mode='p70',
-    d_min=8
+    similarity_quantile=0.70,
+    similarity_std_lambda=0.50,
+    d_min=8,
 ):
 
     edge_list = torch.LongTensor(
@@ -139,15 +141,58 @@ def generate_drug_data(
     else:
         k = min(topk, similarity_vector.numel())
         topk_values, topk_indices = torch.topk(similarity_vector, k)
+        
+
 
         positive = similarity_vector[similarity_vector > 0]
-        if tau_mode == 'p70':
-            tau = torch.quantile(positive, 0.70) if positive.numel() > 0 else torch.tensor(0.0)
-        elif tau_mode == 'mean+0.5std':
-            tau = (positive.mean() + 0.5 * positive.std()) if positive.numel() > 0 else torch.tensor(0.0)
-        else:
-            tau = torch.tensor(float(tau_mode))
 
+        if not 0.0 < similarity_quantile < 1.0:
+            raise ValueError(
+                'similarity_quantile must be between 0 and 1.'
+            )
+        
+        if similarity_std_lambda < 0.0:
+            raise ValueError(
+                'similarity_std_lambda must be non-negative.'
+            )
+        
+        if positive.numel() > 0:
+
+            tau_q = torch.quantile(
+                positive,
+                similarity_quantile,
+            )
+        
+          
+            similarity_mean = positive.mean()
+        
+          
+            similarity_std = positive.std(
+                unbiased=False,
+            )
+        
+            tau_mu = (
+                similarity_mean
+                + similarity_std_lambda * similarity_std
+            )
+        
+           
+            tau = torch.maximum(
+                tau_q,
+                tau_mu,
+            )
+        else:
+            tau_q = similarity_vector.new_tensor(0.0)
+            tau_mu = similarity_vector.new_tensor(0.0)
+            tau = similarity_vector.new_tensor(0.0)
+
+
+
+
+
+
+
+    
         mask = topk_values >= tau
         kept_indices = topk_indices[mask]
         kept_values  = topk_values[mask]
@@ -175,40 +220,122 @@ def generate_drug_data(
         edge_index=new_edge_index,
         line_graph_edge_index=line_graph_edge_index,
         edge_attr=edge_feats,
-        sim=sparse_sim.unsqueeze(0),  # [1, N]
-        id=id
+        sim=sparse_sim.unsqueeze(0),
+        id=str(drug_id),
+        smiles=canonical_smiles,
     )
     return data
 
+def generate_drug_data_dgl(
+    mol_graph,
+    atom_symbols,
+):
+    raw_edges = [
+        (
+            bond.GetBeginAtomIdx(),
+            bond.GetEndAtomIdx(),
+            *edge_features(bond),
+        )
+        for bond in mol_graph.GetBonds()
+    ]
+
+    if raw_edges:
+        edge_tensor = torch.tensor(
+            raw_edges,
+            dtype=torch.long,
+        )
+
+        edge_index = edge_tensor[:, :2]
+        edge_features_tensor = (
+            edge_tensor[:, 2:].float()
+        )
+
+        # 无向键展开为两个方向，并保持 PyG 与 DGL 顺序一致。
+        edge_index = torch.cat(
+            [
+                edge_index,
+                edge_index[:, [1, 0]],
+            ],
+            dim=0,
+        )
+        edge_features_tensor = torch.cat(
+            [
+                edge_features_tensor,
+                edge_features_tensor,
+            ],
+            dim=0,
+        )
+    else:
+        edge_index = torch.empty(
+            (0, 2),
+            dtype=torch.long,
+        )
+        edge_features_tensor = torch.empty(
+            (0, 6),
+            dtype=torch.float32,
+        )
+
+    atom_feature_items = [
+        (
+            atom.GetIdx(),
+            atom_features(
+                atom,
+                atom_symbols,
+            ),
+        )
+        for atom in mol_graph.GetAtoms()
+    ]
+    atom_feature_items.sort(
+        key=lambda item: item[0]
+    )
+
+    if not atom_feature_items:
+        raise ValueError(
+            'Molecule has no atoms.'
+        )
+
+    node_features = torch.stack(
+        [
+            feature
+            for _, feature in atom_feature_items
+        ],
+        dim=0,
+    )
+
+    if edge_index.numel() > 0:
+        source = edge_index[:, 0]
+        target = edge_index[:, 1]
+    else:
+        source = torch.empty(
+            0,
+            dtype=torch.long,
+        )
+        target = torch.empty(
+            0,
+            dtype=torch.long,
+        )
+
+    graph = dgl.graph(
+        (source, target),
+        num_nodes=node_features.size(0),
+    )
+
+    graph.ndata['feat'] = node_features.long()
+    graph.edata['feat'] = (
+        edge_features_tensor.long()
+    )
+
+    return graph
 
 
-def generate_drug_data_dgl(mol_graph, atom_symbols):
-    edge_list = torch.LongTensor(
-        [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), *edge_features(b)) for b in mol_graph.GetBonds()])
-    edge_list, edge_feats = (edge_list[:, :2], edge_list[:, 2:].float()) if len(edge_list) else (
-    torch.LongTensor([]), torch.FloatTensor([]))
-    edge_list = torch.cat([edge_list, edge_list[:, [1, 0]]], dim=0) if len(edge_list) else edge_list
-    edge_feats = torch.cat([edge_feats] * 2, dim=0) if len(edge_feats) else edge_feats
-
-    features = [(atom.GetIdx(), atom_features(atom, atom_symbols)) for atom in mol_graph.GetAtoms()]
-    features.sort()
-    _, features = zip(*features)
-    features = torch.stack(features)
-    node_feature = features.long()
-    edge_feature = edge_feats.long()
-
-    g = dgl.DGLGraph()
-    g.add_nodes(features.shape[0])
-    g.ndata['feat'] = node_feature
-    for src, dst in edge_list:
-        g.add_edges(src.item(), dst.item())
-    g.edata['feat'] = edge_feature
-    data_dgl = g
-    return data_dgl
 
 
-def finalize_similarity_graph(drug_data_pyg, id_to_idx, d_min=8, d_max=64, make_symmetric='min'):
-
+def finalize_similarity_graph(
+    drug_data_pyg,
+    id_to_idx,
+    d_min=8,
+    d_max=64,
+):
     ids = list(drug_data_pyg.keys())
     N = len(ids)
 
@@ -230,16 +357,8 @@ def finalize_similarity_graph(drug_data_pyg, id_to_idx, d_min=8, d_max=64, make_
 
 
     S_T = S.transpose().tocsr()
-    if make_symmetric == 'min':
-        S_mut = S.minimum(S_T)
-        S_mut.eliminate_zeros()  # 清理显式0
-    elif make_symmetric == 'mean':
-
-        M = S.minimum(S_T)
-        M.eliminate_zeros()
-        S_mut = M
-    else:
-        raise ValueError('make_symmetric must be "min" or "mean"')
+    S_mut = S.minimum(S_T)
+    S_mut.eliminate_zeros()
 
 
     def row_topk_csr(A, k):
@@ -290,13 +409,15 @@ def finalize_similarity_graph(drug_data_pyg, id_to_idx, d_min=8, d_max=64, make_
     return drug_data_pyg
 
 
+
 def load_drug_mol_data(
     args,
     topk=32,
-    tau_mode='p70',
+    similarity_quantile=0.70,
+    similarity_std_lambda=0.50,
     d_min=8,
     d_max=64,
-    do_finalize=True
+    do_finalize=True,
 ):
 
     df = pd.read_csv(args.dataset_filename, delimiter=args.delimiter)
@@ -335,15 +456,21 @@ def load_drug_mol_data(
     drug_data_pyg = {}
     for did, mol in tqdm(drug_id_mol_tup, desc='Processing drugs_pyg'):
         self_idx = id_to_idx[did]
+
         data_i = generate_drug_data(
             mol_graph=mol,
             atom_symbols=symbols,
             fps_all=fps_all,
-            id=did,
+            drug_id=did,
+            canonical_smiles=Chem.MolToSmiles(
+                mol,
+                canonical=True,
+            ),
             self_idx=self_idx,
             topk=topk,
-            tau_mode=tau_mode,
-            d_min=d_min
+            similarity_quantile=similarity_quantile,
+            similarity_std_lambda=similarity_std_lambda,
+            d_min=d_min,
         )
         drug_data_pyg[did] = data_i
 
@@ -353,8 +480,12 @@ def load_drug_mol_data(
 
 
     if do_finalize and 'finalize_similarity_graph' in globals():
+
         drug_data_pyg = finalize_similarity_graph(
-            drug_data_pyg, id_to_idx, d_min=d_min, d_max=d_max, make_symmetric='min'
+            drug_data_pyg,
+            id_to_idx,
+            d_min=d_min,
+            d_max=d_max,
         )
 
 
@@ -886,10 +1017,20 @@ def write_static_dataset_metadata(
             'tail_smiles': args.c_s2,
             'relation': args.c_y,
         },
+
         'similarity_graph': {
             'morgan_radius': 2,
             'topk': int(args.sim_topk),
-            'tau_mode': args.tau_mode,
+            'threshold_formula': (
+                'max(quantile, mean + lambda * std)'
+            ),
+            'quantile': float(
+                args.sim_quantile
+            ),
+            'std_lambda': float(
+                args.sim_std_lambda
+            ),
+            'std_unbiased': False,
             'd_min': int(args.d_min),
             'd_max': int(args.d_max),
         },
@@ -1167,7 +1308,25 @@ if __name__ == '__main__':
 
 
     parser.add_argument('--sim-topk', type=int, default=32)
-    parser.add_argument('--tau-mode', default='p70')
+    parser.add_argument(
+        '--sim-quantile',
+        type=float,
+        default=0.70,
+        help=(
+            'Quantile q used in tau_q. '
+            'The manuscript uses P70 by default.'
+        ),
+    )
+    
+    parser.add_argument(
+        '--sim-std-lambda',
+        type=float,
+        default=0.50,
+        help=(
+            'Lambda used in '
+            'tau_mu = mean + lambda * std.'
+        ),
+    )
     parser.add_argument('--d-min', type=int, default=8)
     parser.add_argument('--d-max', type=int, default=64)
 
@@ -1220,10 +1379,14 @@ if __name__ == '__main__':
         raise ValueError('--unseen-ratio must be between 0 and 1.')
 
     if args.operation in {'all', 'drug_data'}:
+
         load_drug_mol_data(
             args,
             topk=args.sim_topk,
-            tau_mode=args.tau_mode,
+            similarity_quantile=args.sim_quantile,
+            similarity_std_lambda=(
+                args.sim_std_lambda
+            ),
             d_min=args.d_min,
             d_max=args.d_max,
             do_finalize=True,
