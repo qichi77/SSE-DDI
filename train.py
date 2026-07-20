@@ -1,180 +1,622 @@
-import torch.optim as optim
-
-import torch.nn as nn
-
-#1 from dataset import load_ddi_dataset
-from dataset import load_ddi_dataset
-
-from logger.train_logger import TrainLogger
-from data_pre import CustomData
 import argparse
-from metrics import *
-from utils import *
+import copy
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from tqdm import tqdm
-import warnings
 
+
+from data_pre import CustomData  
+from dataset import load_ddi_dataset
+from metrics import do_compute_metrics
 from model import gnn_model
+from utils import AverageMeter, set_seed
 
-warnings.filterwarnings("ignore")
 
-def val(AIF, criterion, dataloader, device, epoch):
-    AIF.eval()
-    running_loss = AverageMeter()
+METRIC_NAMES = [
+    'acc',
+    'auc',
+    'f1',
+    'precision',
+    'recall',
+    'ap',
+]
 
-    pred_list = []
-    label_list = []
 
-    for data in tqdm(dataloader,desc='val_epoch_{}'.format(epoch),leave=True):
-        head_pairs, tail_pairs, head_pairs_dgl, tail_pairs_dgl, rel, label = [d.to(device) for d in data]
-        sim_h = head_pairs.sim
-        sim_t = tail_pairs.sim
+def move_batch_to_device(batch, device):
+    return tuple(
+        item.to(device)
+        for item in batch
+    )
 
-        batch_h_e = head_pairs_dgl.edata['feat']
-        batch_t_e = tail_pairs_dgl.edata['feat']
-        with torch.no_grad():
-            pred = AIF.forward(head_pairs, tail_pairs, head_pairs_dgl, tail_pairs_dgl,batch_h_e, batch_t_e, rel, sim_h, sim_t)
-            loss = criterion(pred, label)
-            pred_cls = torch.sigmoid(pred)
-            pred_list.append(pred_cls.view(-1).detach().cpu().numpy())
-            label_list.append(label.detach().cpu().numpy())
-            running_loss.update(loss.item(), label.size(0))
 
-    pred_probs = np.concatenate(pred_list, axis=0)
-    label = np.concatenate(label_list, axis=0)
+def forward_batch(model, batch, device):
+    (
+        head_pairs,
+        tail_pairs,
+        head_pairs_dgl,
+        tail_pairs_dgl,
+        relation,
+        label,
+    ) = move_batch_to_device(batch, device)
 
-    acc, auroc, f1_score, precision, recall, ap = do_compute_metrics(pred_probs, label)
+    head_similarity = head_pairs.sim
+    tail_similarity = tail_pairs.sim
 
-    epoch_loss = running_loss.get_average()
-    running_loss.reset()
+    head_edge_features = (
+        head_pairs_dgl.edata['feat']
+    )
+    tail_edge_features = (
+        tail_pairs_dgl.edata['feat']
+    )
 
-    AIF.train()
+    logits = model(
+        head_pairs,
+        tail_pairs,
+        head_pairs_dgl,
+        tail_pairs_dgl,
+        head_edge_features,
+        tail_edge_features,
+        relation,
+        head_similarity,
+        tail_similarity,
+    )
 
-    return epoch_loss, acc, auroc, f1_score, precision, recall, ap
+    return logits.view(-1), label.view(-1)
+
+
+def compute_metric_dict(probabilities, labels):
+    metric_values = do_compute_metrics(
+        probabilities,
+        labels,
+    )
+
+    return {
+        metric_name: float(metric_value)
+        for metric_name, metric_value in zip(
+            METRIC_NAMES,
+            metric_values,
+        )
+    }
+
+
+def train_one_epoch(
+    model,
+    dataloader,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+):
+    model.train()
+
+    loss_meter = AverageMeter()
+    all_probabilities = []
+    all_labels = []
+
+    progress_bar = tqdm(
+        dataloader,
+        desc=f'train epoch {epoch}',
+        leave=False,
+    )
+
+    for batch in progress_bar:
+        logits, labels = forward_batch(
+            model=model,
+            batch=batch,
+            device=device,
+        )
+
+        loss = criterion(logits, labels)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        probabilities = torch.sigmoid(logits)
+
+        loss_meter.update(
+            loss.item(),
+            labels.size(0),
+        )
+
+        all_probabilities.append(
+            probabilities.detach().cpu().numpy()
+        )
+        all_labels.append(
+            labels.detach().cpu().numpy()
+        )
+
+        progress_bar.set_postfix(
+            loss=f'{loss_meter.get_average():.4f}'
+        )
+
+    probabilities = np.concatenate(
+        all_probabilities,
+        axis=0,
+    )
+    labels = np.concatenate(
+        all_labels,
+        axis=0,
+    )
+
+    result = compute_metric_dict(
+        probabilities,
+        labels,
+    )
+    result['loss'] = float(
+        loss_meter.get_average()
+    )
+
+    return result
+
+
+@torch.no_grad()
+def evaluate(
+    model,
+    dataloader,
+    criterion,
+    device,
+    split_name,
+):
+    model.eval()
+
+    loss_meter = AverageMeter()
+    all_probabilities = []
+    all_labels = []
+
+    for batch in tqdm(
+        dataloader,
+        desc=f'evaluate {split_name}',
+        leave=False,
+    ):
+        logits, labels = forward_batch(
+            model=model,
+            batch=batch,
+            device=device,
+        )
+
+        loss = criterion(logits, labels)
+        probabilities = torch.sigmoid(logits)
+
+        loss_meter.update(
+            loss.item(),
+            labels.size(0),
+        )
+
+        all_probabilities.append(
+            probabilities.cpu().numpy()
+        )
+        all_labels.append(
+            labels.cpu().numpy()
+        )
+
+    probabilities = np.concatenate(
+        all_probabilities,
+        axis=0,
+    )
+    labels = np.concatenate(
+        all_labels,
+        axis=0,
+    )
+
+    result = compute_metric_dict(
+        probabilities,
+        labels,
+    )
+    result['loss'] = float(
+        loss_meter.get_average()
+    )
+
+    return result
+
+
+def format_metrics(metrics):
+    fields = [
+        f'{name}={value:.4f}'
+        for name, value in metrics.items()
+    ]
+    return ', '.join(fields)
+
+
+def save_json(data, output_file):
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with output_file.open(
+        'w',
+        encoding='utf-8',
+    ) as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Train paper-consistent SSE-DDI.'
+    )
+
+    parser.add_argument(
+        '--dataset',
+        choices=['drugbank', 'twosides'],
+        required=True,
+    )
+    parser.add_argument(
+        '--mode',
+        choices=['transductive', 'inductive'],
+        required=True,
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        '--data-root',
+        default='./data/processed',
+    )
+    parser.add_argument(
+        '--result-root',
+        default='./results',
+    )
+    parser.add_argument(
+        '--checkpoint-root',
+        default='./checkpoints',
+    )
+
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        '--weight-decay',
+        type=float,
+        default=1e-3,
+    )
+    parser.add_argument(
+        '--dropout',
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
+        '--lr-gamma',
+        type=float,
+        default=0.98,
+    )
+    parser.add_argument(
+        '--hidden-dim',
+        type=int,
+        default=96,
+    )
+    parser.add_argument(
+        '--n-heads',
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        '--transformer-layers',
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        '--learning-rate',
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        '--n-iter',
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=0,
+    )
+
+    return parser.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser()
+    args = parse_args()
+    set_seed(args.seed)
 
-    # Add argument
-    parser.add_argument('--n_iter', type=int, default=10, help='number of GNN')
-    parser.add_argument('--L', type=int, default=3, help='number of Graph Transformer')
-    parser.add_argument('--fold', type=int, default=1, help='[0, 1, 2]')
-    parser.add_argument('--epochs', type=int, default=200, help='number of epochs')
-    parser.add_argument('--weight_decay', type=float, default=5e-4, help='number of epochs')
-    parser.add_argument('--batch_size', type=int, default=512, help='batch size')
-    parser.add_argument('--save_model', action='store_true', help='whether save model or not')
-    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-    args = parser.parse_args()
+   
+    if args.mode == 'transductive':
+        learning_rate = (
+            1e-4
+            if args.learning_rate is None
+            else args.learning_rate
+        )
+        n_iter = (
+            8
+            if args.n_iter is None
+            else args.n_iter
+        )
+    else:
+        learning_rate = (
+            2e-5
+            if args.learning_rate is None
+            else args.learning_rate
+        )
+        n_iter = (
+            6
+            if args.n_iter is None
+            else args.n_iter
+        )
 
-    params = dict(
-        model='AIF-DDI',
-        data_root='/tmp/AIF-DDI/DrugBank/data/warm start',
-        save_dir='save',
-        dataset='drugbank',
-        epochs=args.epochs,
-        fold=args.fold,
-        save_model=args.save_model,
-        lr=args.lr,
+    dataset_root = (
+        Path(args.data_root) / args.dataset
+    )
+
+    metadata_file = (
+        dataset_root / 'dataset_meta.json'
+    )
+    if not metadata_file.exists():
+        raise FileNotFoundError(
+            f'{metadata_file} does not exist.'
+        )
+
+    with metadata_file.open(
+        'r',
+        encoding='utf-8',
+    ) as file:
+        metadata = json.load(file)
+
+    loaders = load_ddi_dataset(
+        root=dataset_root,
         batch_size=args.batch_size,
-        n_iter=args.n_iter,
+        mode=args.mode,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
+
+    first_batch = next(iter(loaders['train']))
+
+    node_dim = int(
+        first_batch[0].x.size(-1)
+    )
+    edge_dim = int(
+        first_batch[0].edge_attr.size(-1)
+    )
+    observed_similarity_dim = int(
+        first_batch[0].sim.size(-1)
+    )
+
+    metadata_similarity_dim = int(
+        metadata['similarity_dim']
+    )
+    if (
+        observed_similarity_dim
+        != metadata_similarity_dim
+    ):
+        raise ValueError(
+            'Similarity input dimension mismatch: '
+            f'batch={observed_similarity_dim}, '
+            f'metadata={metadata_similarity_dim}'
+        )
+
+    if args.hidden_dim % args.n_heads != 0:
+        raise ValueError(
+            '--hidden-dim must be divisible by --n-heads.'
+        )
+
+    device = torch.device(
+        'cuda:0'
+        if torch.cuda.is_available()
+        else 'cpu'
+    )
+
+    net_params = {
+        'L': args.transformer_layers,
+        'n_heads': args.n_heads,
+        'hidden_dim': args.hidden_dim,
+        'out_dim': args.hidden_dim,
+        'edge_feat': True,
+        'residual': True,
+        'readout': 'mean',
+        'in_feat_dropout': args.dropout,
+        'dropout': args.dropout,
+        'layer_norm': False,
+        'batch_norm': True,
+        'self_loop': False,
+        'lap_pos_enc': True,
+        'pos_enc_dim': 6,
+        'full_graph': False,
+        'batch_size': args.batch_size,
+        'num_atom_type': node_dim,
+        'num_bond_type': edge_dim,
+        'device': device,
+        'n_iter': n_iter,
+        'num_relations': int(
+            metadata['num_relations']
+        ),
+        'similarity_dim': metadata_similarity_dim,
+    }
+
+    model = gnn_model(
+        'GraphTransformer',
+        net_params,
+    ).to(device)
+
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
         weight_decay=args.weight_decay,
-        L = args.L
     )
 
-    logger = TrainLogger(params)
-    logger.info(__file__)
-
-    save_model = params.get('save_model')
-    batch_size = params.get('batch_size')
-    data_root = params.get('data_root')
-    data_set = params.get('dataset')
-    fold = params.get('fold')
-    epochs = params.get('epochs')
-    n_iter = params.get('n_iter')
-    lr = params.get('lr')
-    L = params.get('L')
-    weight_decay = params.get('weight_decay')
-    data_path = os.path.join(data_root, data_set)
-
-    train_loader, val_loader, test_loader = load_ddi_dataset(root=data_path, batch_size=batch_size, fold=fold)
-    data = next(iter(train_loader))
-    node_dim = data[0].x.size(-1)
-    edge_dim = data[0].edge_attr.size(-1)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
-
-    MODEL_NAME = 'GraphTransformer'
-    net_params = dict(
-        L=2,
-        n_heads=6,
-        hidden_dim=96,
-        out_dim=96,
-        edge_feat=True,
-        residual=True,
-        readout="mean",
-        in_feat_dropout=0.2,
-        dropout=0.2,
-        layer_norm=False,
-        batch_norm=True,
-        self_loop=False,
-        lap_pos_enc=True,
-        pos_enc_dim=6,
-        full_graph=False,
-        batch_size=512,
-        num_atom_type=node_dim,
-        num_bond_type=edge_dim,
-        device=device,
-        n_iter=n_iter
-    )
-    print("start with warm start fold_{}".format(fold) + " transformer have {} layers".format(L),"sub extract have {} layers".format(n_iter))
-    AIF = gnn_model(MODEL_NAME, net_params).to(device)
-
-    optimizer = optim.Adam(AIF.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.BCEWithLogitsLoss()
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 0.98 ** (epoch))
 
-    running_loss = AverageMeter()
-    running_acc = AverageMeter()
+    scheduler = optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=args.lr_gamma,
+    )
 
+    best_val_auc = -math.inf
+    best_epoch = -1
+    best_state = None
+    history = []
 
-    AIF.train()
-    for epoch in range(epochs):
-        for data in tqdm(train_loader,desc='train_loader_epoch_{}'.format(epoch),leave=True):
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = train_one_epoch(
+            model=model,
+            dataloader=loaders['train'],
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+        )
 
-            head_pairs, tail_pairs, head_pairs_dgl, tail_pairs_dgl, rel, label = [d.to(device) for d in data]
+        val_metrics = evaluate(
+            model=model,
+            dataloader=loaders['val'],
+            criterion=criterion,
+            device=device,
+            split_name='validation',
+        )
 
-            sim_h = head_pairs.sim
-            sim_t = tail_pairs.sim
+        current_val_auc = val_metrics['auc']
 
-            batch_h_e = head_pairs_dgl.edata['feat']
-            batch_t_e = tail_pairs_dgl.edata['feat']
-            pred = AIF.forward(head_pairs, tail_pairs, head_pairs_dgl, tail_pairs_dgl,batch_h_e, batch_t_e, rel, sim_h, sim_t)
-            loss = criterion(pred, label)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+       
+        if math.isnan(current_val_auc):
+            selection_score = -val_metrics['loss']
+        else:
+            selection_score = current_val_auc
 
-            pred_cls = (torch.sigmoid(pred) > 0.5).detach().cpu().numpy()
-            acc = accuracy(label.detach().cpu().numpy(), pred_cls)
-            running_acc.update(acc)
-            running_loss.update(loss.item(), label.size(0))
+        if selection_score > best_val_auc:
+            best_val_auc = selection_score
+            best_epoch = epoch
+            best_state = copy.deepcopy(
+                model.state_dict()
+            )
 
-        epoch_loss = running_loss.get_average()
-        epoch_acc = running_acc.get_average()
-        running_loss.reset()
-        running_acc.reset()
-
-        val_loss, val_acc, val_auroc, val_f1_score, val_precision, val_recall, val_ap = val(AIF, criterion, val_loader, device, epoch)
-        val_msg = "epoch-%d, train_loss-%.4f, train_acc-%.4f, val_loss-%.4f, val_acc-%.4f, val_auroc-%.4f, val_f1_score-%.4f, val_prec-%.4f, val_rec-%.4f, val_ap-%.4f" % (epoch, epoch_loss, epoch_acc, val_loss, val_acc, val_auroc, val_f1_score, val_precision, val_recall, val_ap)
-
-        logger.info(val_msg)
         scheduler.step()
-        if save_model:
-            msg = "epoch-%d, train_loss-%.4f, train_acc-%.4f, val_loss-%.4f, val_acc-%.4f" % (epoch, epoch_loss, epoch_acc, val_loss, val_acc)
-            save_model_dict(AIF, logger.get_model_dir(), msg)
+
+        epoch_record = {
+            'epoch': epoch,
+            'learning_rate': float(
+                optimizer.param_groups[0]['lr']
+            ),
+            'train': train_metrics,
+            'validation': val_metrics,
+        }
+        history.append(epoch_record)
+
+        print(
+            f'Epoch {epoch:03d} | '
+            f'train: {format_metrics(train_metrics)} | '
+            f'validation: {format_metrics(val_metrics)}'
+        )
+
+    if best_state is None:
+        raise RuntimeError(
+            'No valid model checkpoint was selected.'
+        )
+
+    model.load_state_dict(best_state)
+
+    checkpoint_dir = (
+        Path(args.checkpoint_root)
+        / args.dataset
+        / args.mode
+    )
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    checkpoint_file = (
+        checkpoint_dir
+        / f'seed{args.seed}_best.pt'
+    )
+    torch.save(best_state, checkpoint_file)
+
+    result = {
+        'dataset': args.dataset,
+        'mode': args.mode,
+        'seed': int(args.seed),
+        'best_epoch': int(best_epoch),
+        'checkpoint': str(checkpoint_file),
+        'hyperparameters': {
+            'epochs': int(args.epochs),
+            'batch_size': int(args.batch_size),
+            'learning_rate': float(learning_rate),
+            'weight_decay': float(args.weight_decay),
+            'lr_gamma': float(args.lr_gamma),
+            'dropout': float(args.dropout),
+            'hidden_dim': int(args.hidden_dim),
+            'n_heads': int(args.n_heads),
+            'transformer_layers': int(
+                args.transformer_layers
+            ),
+            'n_iter': int(n_iter),
+        },
+        'history': history,
+    }
+
+    if args.mode == 'transductive':
+        result['test'] = evaluate(
+            model=model,
+            dataloader=loaders['test'],
+            criterion=criterion,
+            device=device,
+            split_name='test',
+        )
+        print(
+            'Test: '
+            + format_metrics(result['test'])
+        )
+    else:
+        result['s1'] = evaluate(
+            model=model,
+            dataloader=loaders['s1'],
+            criterion=criterion,
+            device=device,
+            split_name='S1',
+        )
+        result['s2'] = evaluate(
+            model=model,
+            dataloader=loaders['s2'],
+            criterion=criterion,
+            device=device,
+            split_name='S2',
+        )
+
+        print(
+            'S1: '
+            + format_metrics(result['s1'])
+        )
+        print(
+            'S2: '
+            + format_metrics(result['s2'])
+        )
+
+    result_file = (
+        Path(args.result_root)
+        / args.dataset
+        / args.mode
+        / f'seed{args.seed}.json'
+    )
+    save_json(result, result_file)
+
+    print(f'Result saved to {result_file}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
-
-
-
