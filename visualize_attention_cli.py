@@ -1,164 +1,596 @@
 import argparse
-import os
-import glob
+import json
+from pathlib import Path
+
+import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from rdkit import Chem
 from rdkit.Chem import Draw
-from dataset import load_ddi_dataset
-from model import gnn_model
-from data_pre import CustomData
 from torch_geometric.data import Batch
 
+from data_pre import CustomData  # noqa: F401
+from dataset import load_ddi_dataset
+from model import gnn_model
 
-def load_model(ckpt_path, net_params, device):
-    model = gnn_model('GraphTransformer', net_params)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+def load_checkpoint(
+    checkpoint_file,
+    net_params,
+    device,
+):
+    payload = torch.load(
+        checkpoint_file,
+        map_location=device,
+    )
+
+    if (
+        isinstance(payload, dict)
+        and 'model_state_dict' in payload
+    ):
+        state_dict = payload[
+            'model_state_dict'
+        ]
+    else:
+        # 兼容旧 checkpoint。
+        state_dict = payload
+
+    model = gnn_model(
+        'GraphTransformer',
+        net_params,
+    )
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
+
     return model
 
 
-from rdkit.Chem import rdDepictor
+def minmax_normalize(values):
+    values = np.asarray(
+        values,
+        dtype=np.float64,
+    )
 
-def visualize_attention(smiles, weights, save_path):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        print(f"[WARN] Failed to parse SMILES: {smiles}")
-        return
-    rdDepictor.Compute2DCoords(mol)
+    value_min = float(values.min())
+    value_max = float(values.max())
 
-    conf = mol.GetConformer()
-    fig = Draw.MolToMPL(mol, size=(300, 300), kekulize=True)
-    ax = fig.axes[0]
+    if value_max - value_min <= 1e-12:
+        return np.zeros_like(values)
 
-    for i, atom in enumerate(mol.GetAtoms()):
-        pos = conf.GetAtomPosition(i)
-        ax.text(pos.x, pos.y, f'{weights[i]:.2f}', fontsize=8, ha='center', va='center', color='red')
-
-    fig.savefig(save_path)
-    plt.close(fig)
+    return (
+        (values - value_min)
+        / (value_max - value_min)
+    )
 
 
+def extract_final_pool_weights(
+    model,
+    graph_batch,
+):
+    """
+    DMPNN 在每次 SSE 迭代中覆盖 att_weights。
+    编码完成后保留的是最后一次迭代的 pooling weights。
+    """
+    graph_copy = graph_batch.clone()
 
-def build_line_graph_edges(edge_index):
-    src, dst = edge_index
-    num_edges = edge_index.size(1)
-    connections = []
-    for i in range(num_edges):
-        for j in range(num_edges):
-            if dst[i].item() == src[j].item():
-                connections.append((i, j))
-    if not connections:
-        return torch.empty((2, 0), dtype=torch.long)
-    return torch.tensor(connections, dtype=torch.long).t()
+    _ = model.drug_encoder(
+        graph_copy
+    )
+
+    attention_module = (
+        model
+        .drug_encoder
+        .line_graph
+        .att
+    )
+
+    weights = getattr(
+        attention_module,
+        'att_weights',
+        None,
+    )
+
+    if weights is None:
+        raise RuntimeError(
+            'The SSE encoder did not expose '
+            'final pooling weights.'
+        )
+
+    return (
+        weights
+        .detach()
+        .reshape(-1)
+    )
 
 
-def add_attention_fields(batch_graph, device):
-    new_data_list = []
-    for g in batch_graph.to_data_list():
-        g = g.clone()
-        g.edge_index_batch = torch.zeros(g.edge_index.size(1), dtype=torch.long, device=device)
-        g.line_graph_edge_index = build_line_graph_edges(g.edge_index).to(device)
-        new_data_list.append(g)
-    return Batch.from_data_list(new_data_list).to(device)
+def bond_state_to_atom_scores(
+    graph_batch,
+    bond_state_weights,
+):
+    """
+    对每个原子，将所有 incident directed bond-state
+    的权重取平均，再进行分子内部 min-max normalization。
+    """
+    atom_score_list = []
+
+    for graph_index in range(
+        graph_batch.num_graphs
+    ):
+        node_start = int(
+            graph_batch.ptr[graph_index]
+        )
+        node_end = int(
+            graph_batch.ptr[
+                graph_index + 1
+            ]
+        )
+        num_atoms = node_end - node_start
+
+        edge_mask = (
+            graph_batch.edge_index_batch
+            == graph_index
+        )
+
+        local_edge_index = (
+            graph_batch.edge_index[
+                :,
+                edge_mask,
+            ]
+            - node_start
+        )
+
+        local_weights = (
+            bond_state_weights[
+                edge_mask
+            ]
+        )
+
+        score_sum = torch.zeros(
+            num_atoms,
+            device=local_weights.device,
+            dtype=local_weights.dtype,
+        )
+        score_count = torch.zeros_like(
+            score_sum
+        )
+
+        if local_edge_index.numel() > 0:
+            source = local_edge_index[0]
+            target = local_edge_index[1]
+
+            score_sum.index_add_(
+                0,
+                source,
+                local_weights,
+            )
+            score_sum.index_add_(
+                0,
+                target,
+                local_weights,
+            )
+
+            ones = torch.ones_like(
+                local_weights
+            )
+            score_count.index_add_(
+                0,
+                source,
+                ones,
+            )
+            score_count.index_add_(
+                0,
+                target,
+                ones,
+            )
+
+        atom_scores = (
+            score_sum
+            / score_count.clamp_min(1.0)
+        )
+
+        normalized = minmax_normalize(
+            atom_scores.cpu().numpy()
+        )
+
+        atom_score_list.append(
+            normalized
+        )
+
+    return atom_score_list
+
+
+def draw_atom_attention(
+    smiles,
+    atom_scores,
+    output_file,
+):
+    molecule = Chem.MolFromSmiles(
+        smiles
+    )
+    if molecule is None:
+        raise ValueError(
+            f'Invalid SMILES: {smiles}'
+        )
+
+    if (
+        molecule.GetNumAtoms()
+        != len(atom_scores)
+    ):
+        raise ValueError(
+            'SMILES atom count does not match '
+            'the graph atom-score count.'
+        )
+
+    highlight_atoms = list(
+        range(molecule.GetNumAtoms())
+    )
+
+    # 低分接近白色，高分接近红色。
+    highlight_colors = {
+        atom_index: (
+            1.0,
+            float(1.0 - score),
+            float(1.0 - score),
+        )
+        for atom_index, score in enumerate(
+            atom_scores
+        )
+    }
+
+    highlight_radii = {
+        atom_index: (
+            0.25 + 0.25 * float(score)
+        )
+        for atom_index, score in enumerate(
+            atom_scores
+        )
+    }
+
+    image = Draw.MolToImage(
+        molecule,
+        size=(600, 450),
+        highlightAtoms=highlight_atoms,
+        highlightAtomColors=(
+            highlight_colors
+        ),
+        highlightAtomRadii=(
+            highlight_radii
+        ),
+        legend='Atom-level SSE attention',
+    )
+
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    image.save(output_file)
+
+
+def move_batch_to_device(
+    batch,
+    device,
+):
+    return tuple(
+        item.to(device)
+        for item in batch
+    )
+
+
+def build_net_params(
+    metadata,
+    first_batch,
+    mode,
+    device,
+    batch_size,
+):
+    hidden_dim = 96
+    n_heads = 6
+
+    return {
+        'L': 2,
+        'n_heads': n_heads,
+        'hidden_dim': hidden_dim,
+        'out_dim': hidden_dim,
+        'edge_feat': True,
+        'residual': True,
+        'readout': 'mean',
+        'in_feat_dropout': 0.2,
+        'dropout': 0.2,
+        'layer_norm': False,
+        'batch_norm': True,
+        'self_loop': False,
+        'lap_pos_enc': True,
+        'pos_enc_dim': 6,
+        'full_graph': False,
+        'batch_size': batch_size,
+        'num_atom_type': int(
+            first_batch[0].x.size(-1)
+        ),
+        'num_bond_type': int(
+            first_batch[0]
+            .edge_attr
+            .size(-1)
+        ),
+        'device': device,
+        'n_iter': (
+            8
+            if mode == 'transductive'
+            else 6
+        ),
+        'num_relations': int(
+            metadata['num_relations']
+        ),
+        'similarity_dim': int(
+            metadata['similarity_dim']
+        ),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--set', type=str, default='test', choices=['train', 'val', 'test'])
-    parser.add_argument('--num', type=int, default=10)
-    parser.add_argument('--ckpt_path', type=str, default=None)
-    parser.add_argument('--ckpt_dir', type=str, default=None)
-    parser.add_argument('--save_dir', type=str, default='./attention_output')
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--fold', type=int, default=0)
-    parser.add_argument('--data_root', type=str, required=True, help='Path to preprocessed graph data')
-    parser.add_argument('--source', type=str, choices=['self', 'gated'], default='self', help='Attention source to visualize')
+
+    parser.add_argument(
+        '--dataset',
+        choices=['drugbank', 'twosides'],
+        required=True,
+    )
+    parser.add_argument(
+        '--mode',
+        choices=[
+            'transductive',
+            'inductive',
+        ],
+        required=True,
+    )
+    parser.add_argument(
+        '--split',
+        choices=[
+            'train',
+            'val',
+            'test',
+            's1',
+            's2',
+        ],
+        required=True,
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        '--checkpoint',
+        required=True,
+    )
+    parser.add_argument(
+        '--data-root',
+        default='./data/processed',
+    )
+    parser.add_argument(
+        '--output-dir',
+        default='./attention_output',
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        '--num-samples',
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        '--correct-positive-only',
+        action='store_true',
+    )
 
     args = parser.parse_args()
 
-    if args.ckpt_path is None and args.ckpt_dir:
-        pt_files = glob.glob(os.path.join(args.ckpt_dir, 'epoch-*.pt'))
-        if not pt_files:
-            raise FileNotFoundError(f"No checkpoints found in {args.ckpt_dir}")
-        args.ckpt_path = max(pt_files, key=os.path.getmtime)
-        print(f"[INFO] Using latest checkpoint: {args.ckpt_path}")
+    if (
+        args.mode == 'transductive'
+        and args.split in {'s1', 's2'}
+    ):
+        raise ValueError(
+            'S1/S2 require inductive mode.'
+        )
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if (
+        args.mode == 'inductive'
+        and args.split == 'test'
+    ):
+        raise ValueError(
+            'Inductive mode uses S1 and S2.'
+        )
 
-    train_loader, val_loader, test_loader = load_ddi_dataset(args.data_root, batch_size=args.batch_size, fold=args.fold)
-    loader = {'train': train_loader, 'val': val_loader, 'test': test_loader}[args.set]
-
-    data = next(iter(loader))
-    head, tail, head_dgl, tail_dgl, rel, label = data
-
-    head = Batch.from_data_list(head.to_data_list()).to(device)
-    tail = Batch.from_data_list(tail.to_data_list()).to(device)
-
-    rel = rel.to(device)
-    label = label.to(device)
-
-    head_dgl = head_dgl.to(device)
-    tail_dgl = tail_dgl.to(device)
-    head_dgl.edata['feat'] = head_dgl.edata['feat'].to(device)
-    tail_dgl.edata['feat'] = tail_dgl.edata['feat'].to(device)
-
-    head = add_attention_fields(head, device)
-    tail = add_attention_fields(tail, device)
-
-    node_dim = head.x.size(-1)
-    edge_dim = head.edge_attr.size(-1)
-
-    net_params = dict(
-        L=2,
-        n_heads=6,
-        hidden_dim=96,
-        out_dim=96,
-        edge_feat=True,
-        residual=True,
-        readout="mean",
-        in_feat_dropout=0.2,
-        dropout=0.2,
-        layer_norm=False,
-        batch_norm=True,
-        self_loop=False,
-        lap_pos_enc=True,
-        pos_enc_dim=6,
-        full_graph=False,
-        batch_size=args.batch_size,
-        num_atom_type=node_dim,
-        num_bond_type=edge_dim,
-        device=device,
-        n_iter=10,
-        use_self_attention=(args.source == 'self')
+    device = torch.device(
+        'cuda'
+        if torch.cuda.is_available()
+        else 'cpu'
     )
 
-    model = load_model(args.ckpt_path, net_params, device)
+    dataset_root = (
+        Path(args.data_root)
+        / args.dataset
+    )
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    with (
+        dataset_root
+        / 'dataset_meta.json'
+    ).open(
+        'r',
+        encoding='utf-8',
+    ) as file:
+        metadata = json.load(file)
 
-    with torch.no_grad():
-        model.forward(head, tail, head_dgl, tail_dgl,
-                      head_dgl.edata['feat'], tail_dgl.edata['feat'],
-                      rel, head.sim.to(device), tail.sim.to(device))
+    loaders = load_ddi_dataset(
+        root=dataset_root,
+        batch_size=args.batch_size,
+        mode=args.mode,
+        seed=args.seed,
+        num_workers=0,
+    )
 
-        att_weights = model.drug_encoder.line_graph.att.att_weights
-        if att_weights is None:
-            raise RuntimeError("No attention weights found. Ensure the model's attention layer is correctly storing them.")
+    loader = loaders[args.split]
+    first_batch = next(iter(loader))
 
-        smiles_list = [g.smiles for g in head.to_data_list()]
-        att_weights = att_weights.squeeze().cpu().numpy()
+    net_params = build_net_params(
+        metadata=metadata,
+        first_batch=first_batch,
+        mode=args.mode,
+        device=device,
+        batch_size=args.batch_size,
+    )
 
-        start_idx = 0
-        for i, mol in enumerate(smiles_list[:args.num]):
-            num_atoms = head.ptr[i + 1] - head.ptr[i]
-            w = att_weights[start_idx:start_idx + num_atoms]
-            save_path = os.path.join(args.save_dir, f'{args.set}_sample{i}.png')
-            visualize_attention(mol, w, save_path)
-            start_idx += num_atoms
+    model = load_checkpoint(
+        checkpoint_file=args.checkpoint,
+        net_params=net_params,
+        device=device,
+    )
 
-        print(f"[INFO] Saved {args.num} attention visualizations to: {args.save_dir}")
+    output_dir = Path(
+        args.output_dir
+    )
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    saved_count = 0
+
+    for batch in loader:
+        (
+            head,
+            tail,
+            head_dgl,
+            tail_dgl,
+            relation,
+            labels,
+        ) = move_batch_to_device(
+            batch,
+            device,
+        )
+
+        # 保存未被模型原地修改的图。
+        head_original = head.clone()
+        tail_original = tail.clone()
+
+        with torch.no_grad():
+            logits = model(
+                head.clone(),
+                tail.clone(),
+                head_dgl,
+                tail_dgl,
+                head_dgl.edata['feat'],
+                tail_dgl.edata['feat'],
+                relation,
+                head.sim,
+                tail.sim,
+            )
+
+            probabilities = torch.sigmoid(
+                logits
+            )
+
+            head_weights = (
+                extract_final_pool_weights(
+                    model,
+                    head_original,
+                )
+            )
+            tail_weights = (
+                extract_final_pool_weights(
+                    model,
+                    tail_original,
+                )
+            )
+
+        head_atom_scores = (
+            bond_state_to_atom_scores(
+                head_original,
+                head_weights,
+            )
+        )
+        tail_atom_scores = (
+            bond_state_to_atom_scores(
+                tail_original,
+                tail_weights,
+            )
+        )
+
+        head_graphs = (
+            head_original.to_data_list()
+        )
+        tail_graphs = (
+            tail_original.to_data_list()
+        )
+
+        for index in range(len(labels)):
+            label = int(
+                labels[index].item()
+            )
+            probability = float(
+                probabilities[index].item()
+            )
+
+            if args.correct_positive_only:
+                if not (
+                    label == 1
+                    and probability >= 0.50
+                ):
+                    continue
+
+            head_smiles = (
+                head_graphs[index].smiles
+            )
+            tail_smiles = (
+                tail_graphs[index].smiles
+            )
+
+            prefix = (
+                f'{args.split}_'
+                f'sample{saved_count:04d}_'
+                f'p{probability:.4f}'
+            )
+
+            draw_atom_attention(
+                smiles=head_smiles,
+                atom_scores=(
+                    head_atom_scores[index]
+                ),
+                output_file=(
+                    output_dir
+                    / f'{prefix}_head.png'
+                ),
+            )
+
+            draw_atom_attention(
+                smiles=tail_smiles,
+                atom_scores=(
+                    tail_atom_scores[index]
+                ),
+                output_file=(
+                    output_dir
+                    / f'{prefix}_tail.png'
+                ),
+            )
+
+            saved_count += 1
+
+            if (
+                saved_count
+                >= args.num_samples
+            ):
+                print(
+                    f'Saved {saved_count} samples '
+                    f'to {output_dir}'
+                )
+                return
+
+    print(
+        f'Saved {saved_count} samples '
+        f'to {output_dir}'
+    )
 
 
 if __name__ == '__main__':
