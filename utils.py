@@ -3,10 +3,21 @@ import random
 
 import numpy as np
 import torch
+try:
+    import dgl
+except ImportError:
+    dgl = None
 
 def set_seed(seed):
+    seed = int(seed)
 
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+    # CUDA 确定性矩阵乘法配置。
+    os.environ.setdefault(
+        'CUBLAS_WORKSPACE_CONFIG',
+        ':4096:8',
+    )
 
     random.seed(seed)
     np.random.seed(seed)
@@ -17,6 +28,11 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    if dgl is not None:
+        dgl.seed(seed)
+
+        if hasattr(dgl, 'random'):
+            dgl.random.seed(seed)
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -27,7 +43,7 @@ def set_seed(seed):
             warn_only=True,
         )
     except TypeError:
-
+        # 兼容不支持 warn_only 的旧版 PyTorch。
         torch.use_deterministic_algorithms(True)
 
 
@@ -90,8 +106,23 @@ class AverageMeter(object):
 
         return self.avg
 
-def normalize(x):
-    return (x - x.min()) / (x.max() - x.min())
+def normalize(x, eps=1e-12):
+
+    x_min = x.min()
+    x_max = x.max()
+    denominator = x_max - x_min
+
+    if torch.is_tensor(x):
+        if denominator.abs().item() <= eps:
+            return torch.zeros_like(x)
+    else:
+        if abs(float(denominator)) <= eps:
+            return np.zeros_like(x)
+
+    return (
+        (x - x_min)
+        / (denominator + eps)
+    )
 
 def save_checkpoint(model, model_dir, epoch, val_loss, val_acc):
     model_path = os.path.join(model_dir, 'epoch:%d-val_loss:%.3f-val_acc:%.3f.model' % (epoch, val_loss, val_acc))
