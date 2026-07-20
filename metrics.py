@@ -2,15 +2,70 @@ import numpy as np
 from sklearn import metrics
 
 def do_compute_metrics(probas_pred, target):
-    pred = (probas_pred >= 0.5).astype(np.int)
-    acc = metrics.accuracy_score(target, pred)
-    auroc = metrics.roc_auc_score(target, probas_pred)
-    f1_score = metrics.f1_score(target, pred)
-    ap= metrics.average_precision_score(target, probas_pred)
-    precision = metrics.precision_score(target, pred)
-    recall = metrics.recall_score(target, pred)
+    probas_pred = np.asarray(
+        probas_pred,
+        dtype=np.float64,
+    ).reshape(-1)
 
-    return acc, auroc, f1_score, precision, recall, ap
+    target = np.asarray(
+        target,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    if probas_pred.shape[0] != target.shape[0]:
+        raise ValueError(
+            'Prediction and target lengths are different: '
+            f'{probas_pred.shape[0]} != {target.shape[0]}'
+        )
+
+    pred = (
+        probas_pred >= 0.5
+    ).astype(np.int64)
+
+    acc = metrics.accuracy_score(
+        target,
+        pred,
+    )
+
+    if np.unique(target).size < 2:
+        auroc = float('nan')
+    else:
+        auroc = metrics.roc_auc_score(
+            target,
+            probas_pred,
+        )
+
+    f1_score = metrics.f1_score(
+        target,
+        pred,
+        zero_division=0,
+    )
+
+    precision = metrics.precision_score(
+        target,
+        pred,
+        zero_division=0,
+    )
+
+    recall = metrics.recall_score(
+        target,
+        pred,
+        zero_division=0,
+    )
+
+    ap = metrics.average_precision_score(
+        target,
+        probas_pred,
+    )
+
+    return (
+        acc,
+        auroc,
+        f1_score,
+        precision,
+        recall,
+        ap,
+    )
 
 def positive(y_true):
     return np.sum((y_true == 1))
