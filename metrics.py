@@ -1,119 +1,92 @@
 import numpy as np
 from sklearn import metrics
 
-def do_compute_metrics(probas_pred, target):
-    probas_pred = np.asarray(
+
+METRIC_NAMES = (
+    'acc',
+    'auc',
+    'f1',
+    'precision',
+    'recall',
+    'ap',
+)
+
+
+def do_compute_metrics(
+    probas_pred,
+    target,
+    threshold=0.5,
+):
+    probabilities = np.asarray(
         probas_pred,
         dtype=np.float64,
     ).reshape(-1)
 
-    target = np.asarray(
+    labels = np.asarray(
         target,
         dtype=np.int64,
     ).reshape(-1)
 
-    if probas_pred.shape[0] != target.shape[0]:
+    if probabilities.shape[0] != labels.shape[0]:
         raise ValueError(
-            'Prediction and target lengths are different: '
-            f'{probas_pred.shape[0]} != {target.shape[0]}'
+            'Prediction and target lengths differ: '
+            f'{probabilities.shape[0]} != '
+            f'{labels.shape[0]}'
         )
 
-    pred = (
-        probas_pred >= 0.5
+    if probabilities.size == 0:
+        raise ValueError(
+            'Cannot compute metrics on an empty dataset.'
+        )
+
+    predictions = (
+        probabilities >= threshold
     ).astype(np.int64)
 
     acc = metrics.accuracy_score(
-        target,
-        pred,
+        labels,
+        predictions,
     )
 
-    if np.unique(target).size < 2:
-        auroc = float('nan')
+    if np.unique(labels).size < 2:
+        auc = float('nan')
     else:
-        auroc = metrics.roc_auc_score(
-            target,
-            probas_pred,
+        auc = metrics.roc_auc_score(
+            labels,
+            probabilities,
         )
 
-    f1_score = metrics.f1_score(
-        target,
-        pred,
+    f1 = metrics.f1_score(
+        labels,
+        predictions,
         zero_division=0,
     )
 
     precision = metrics.precision_score(
-        target,
-        pred,
+        labels,
+        predictions,
         zero_division=0,
     )
 
     recall = metrics.recall_score(
-        target,
-        pred,
+        labels,
+        predictions,
         zero_division=0,
     )
 
-    ap = metrics.average_precision_score(
-        target,
-        probas_pred,
-    )
+    if np.sum(labels == 1) == 0:
+        ap = float('nan')
+    else:
+        ap = metrics.average_precision_score(
+            labels,
+            probabilities,
+        )
 
     return (
-        acc,
-        auroc,
-        f1_score,
-        precision,
-        recall,
-        ap,
+        float(acc),
+        float(auc),
+        float(f1),
+        float(precision),
+        float(recall),
+        float(ap),
     )
-
-def positive(y_true):
-    return np.sum((y_true == 1))
-
-def negative(y_true):
-    return np.sum((y_true == 0))
-
-def true_positive(y_true, y_pred):
-    return np.sum(np.bitwise_and(y_true == 1, y_pred == 1))
-
-def false_positive(y_true, y_pred):
-    return np.sum(np.bitwise_and(y_true == 0, y_pred == 1))
-
-def true_negative(y_true, y_pred):
-    return np.sum(np.bitwise_and(y_true == 0, y_pred == 0))
-
-def false_negative(y_true, y_pred):
-    return np.sum(np.bitwise_and(y_true == 1, y_pred == 0))
-
-def accuracy(y_true, y_pred):
-    sample_count = 1.
-    for s in y_true.shape:
-        sample_count *= s
-
-    return np.sum((y_true == y_pred)) / sample_count
-
-def sensitive(y_true, y_pred):
-    tp = true_positive(y_true, y_pred)
-    p = positive(y_true) + 1e-9
-    return tp / p
-
-def specificity(y_true, y_pred):
-    tn = true_negative(y_true, y_pred)
-    n = negative(y_true) + 1e-9
-    return tn / n
-
-def precision(y_true, y_pred):
-    tp = true_positive(y_true, y_pred)
-    fp = false_positive(y_true, y_pred)
-    return tp / (tp + fp)
-
-def recall(y_true, y_pred):
-    tp = true_positive(y_true, y_pred)
-    fn = false_negative(y_true, y_pred)
-    return tp / (tp + fn)
-
-def f1_score(y_true, y_pred):
-    prec = precision(y_true, y_pred)
-    reca = recall(y_true, y_pred)
-    fs = (2 * prec * reca) / (prec + reca)
-    return fs
