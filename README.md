@@ -392,11 +392,37 @@ A summary contains:
 - raw column definitions;
 - Morgan fingerprint radius;
 - similarity top-k value;
-- threshold mode;
+- similarity threshold formula
+  `max(quantile, mean + lambda × standard deviation)`;
+- similarity quantile, default `0.70`;
+- statistical threshold coefficient `lambda`,
+  default `0.50`;
 - minimum and maximum refined graph degrees.
 
 The reported dataset statistics in the paper should be taken from this processed metadata rather than from the complete external database.
+## Validate generated splits
 
+```bash
+python validate_splits.py \
+  --dataset drugbank \
+  --mode transductive \
+  --seed 0
+python validate_splits.py \
+  --dataset drugbank \
+  --mode inductive \
+  --seed 0
+
+## Final-iteration SSE attention visualization
+
+```bash
+python visualize_attention_cli.py \
+  --dataset drugbank \
+  --mode transductive \
+  --split test \
+  --seed 0 \
+  --checkpoint checkpoints/drugbank/transductive/seed0_best.pt \
+  --correct-positive-only \
+  --num-samples 10
 ## Reproducibility checks
 
 Before training, check Python syntax:
@@ -451,18 +477,7 @@ For inductive splits, additionally verify:
 - positive triplets are mutually disjoint across splits;
 - generated negative triplets do not occur in the complete positive set.
 
-## Notes
-
-The modified implementation aligns the public code with the manuscript in terms of:
-
-- supported datasets;
-- transductive data splitting;
-- inductive S1/S2 evaluation;
-- negative sampling;
-- model dimensions;
-- default hyperparameters;
-- validation-based checkpoint selection;
-- five-seed evaluation;
-- mean and standard-deviation reporting.
-
-After these modifications, all results in the manuscript should be regenerated from the public scripts and configurations. Results produced by an earlier implementation should not be retained unless they are independently reproduced by the released code.
+The released implementation is intended to match the experimental
+protocol described in the manuscript. All manuscript results must be
+regenerated from the released scripts, validated splits, configurations,
+and checkpoints before the repository is declared fully reproducible.
