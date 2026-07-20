@@ -475,6 +475,9 @@ def main():
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        epoch_learning_rate = float(
+            optimizer.param_groups[0]['lr']
+        )
         train_metrics = train_one_epoch(
             model=model,
             dataloader=loaders['train'],
@@ -511,9 +514,7 @@ def main():
 
         epoch_record = {
             'epoch': epoch,
-            'learning_rate': float(
-                optimizer.param_groups[0]['lr']
-            ),
+            'learning_rate': epoch_learning_rate,
             'train': train_metrics,
             'validation': val_metrics,
         }
