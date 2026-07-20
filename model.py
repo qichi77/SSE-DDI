@@ -9,8 +9,8 @@ from torch_scatter import scatter
 from torch_geometric.utils import degree
 import torch
 import torch.nn as nn
+import math
 
-import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import softmax
@@ -60,68 +60,124 @@ def exp(field):
     return func
 
 
-class GatedAttentionLayer(nn.Module):
-    def __init__(self, in_dim, out_dim=None):
-        super(GatedAttentionLayer, self).__init__()
+class PairwiseGatedLineGraphConv(nn.Module):
+
+
+    def __init__(
+        self,
+        in_dim,
+        out_dim=None,
+        att_dim=None,
+        gate_hidden_dim=None,
+        eps=1e-8,
+    ):
+        super().__init__()
 
         if out_dim is None:
             out_dim = in_dim
+        if att_dim is None:
+            att_dim = out_dim
+        if gate_hidden_dim is None:
+            gate_hidden_dim = in_dim
 
+        self.in_dim = in_dim
         self.out_dim = out_dim
+        self.att_dim = att_dim
+        self.eps = eps
 
-        self.query = nn.Linear(in_dim, out_dim)
-        self.key = nn.Linear(in_dim, out_dim)
+        # The destination state supplies the query.
+        self.query = nn.Linear(in_dim, att_dim)
+
+        # The source state supplies the key and value.
+        self.key = nn.Linear(in_dim, att_dim)
         self.value = nn.Linear(in_dim, out_dim)
-        self.gate = nn.Linear(in_dim, 1)
 
+        # Pair-conditioned gate:
+        # [h_src || h_dst || h_src * h_dst] -> scalar.
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(3 * in_dim, gate_hidden_dim),
+            nn.PReLU(),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+
+        # Saved for visualization and analysis.
         self.att_weights = None
+        self.gate_values = None
+        self.route_edge_index = None
 
     def forward(self, x, edge_index):
-        # x: [N_line, in_dim]
-        q = self.query(x)       # [N_line, d_a]
-        k = self.key(x)         # [N_line, d_a]
-        v = self.value(x)       # [N_line, out_dim]
+        """
+        Args:
+            x:
+                Directed bond-state features, shape [N_bond_states, in_dim].
+            edge_index:
+                Directed line-graph transitions, shape [2, E_line].
+                edge_index[0] is src and edge_index[1] is dst.
 
-        # Source-conditioned scalar gate.
-        gate_values = torch.sigmoid(self.gate(x))  # [N_line, 1]
+        Returns:
+            out:
+                Selectively aggregated incoming messages for every bond state,
+                shape [N_bond_states, out_dim].
+        """
+        num_nodes = x.size(0)
 
-        # Each line-graph edge is src -> dst.
+        # Handle molecules with no valid line-graph transition.
+        if edge_index.numel() == 0:
+            self.att_weights = x.new_empty((0,))
+            self.gate_values = x.new_empty((0,))
+            self.route_edge_index = edge_index.detach()
+            return x.new_zeros((num_nodes, self.out_dim))
+
         src, dst = edge_index
 
-        # Scaled dot-product compatibility.
-        # d_a is the query/key dimensionality.
-        d_a = q.size(-1)
-        att_scores = (
-            (q[src] * k[dst]).sum(dim=-1) / (d_a ** 0.5)
-        )  # [E_line]
+        q = self.query(x)  # [N, d_a]
+        k = self.key(x)    # [N, d_a]
+        v = self.value(x)  # [N, out_dim]
 
-        # Apply the source-conditioned gate before softmax.
-        gated_score = (
-            att_scores * gate_values[src].squeeze(-1)
-        )  # [E_line]
 
-        # Normalize over the outgoing neighbors of each fixed source.
-        att_weights = softmax(
-            gated_score,
-            src,
-            num_nodes=x.size(0)
-        )  # [E_line]
+        pair_feature = torch.cat(
+            [
+                x[src],
+                x[dst],
+                x[src] * x[dst],
+            ],
+            dim=-1,
+        )  # [E_line, 3 * in_dim]
 
-        self.att_weights = att_weights.detach()
+        gate = torch.sigmoid(
+            self.gate_mlp(pair_feature)
+        ).squeeze(-1)  # [E_line]
 
-        # Aggregate destination values back to each source state.
-        out = torch.zeros(
-            x.size(0),
-            self.out_dim,
-            device=x.device,
-            dtype=v.dtype
+        score = (
+            q[dst] * k[src]
+        ).sum(dim=-1) / math.sqrt(self.att_dim)  # [E_line]
+
+        gated_logit = score + torch.log(
+            gate.clamp_min(self.eps)
         )
 
-        out.index_add_(
-            0,
-            src,
-            att_weights.unsqueeze(-1) * v[dst]
-        )
+
+        alpha = softmax(
+            gated_logit,
+            dst,
+            num_nodes=num_nodes,
+        )  # [E_line]
+
+
+        message = alpha.unsqueeze(-1) * v[src]
+
+        out = scatter(
+            message,
+            dst,
+            dim=0,
+            dim_size=num_nodes,
+            reduce="sum",
+        )  # [N_bond_states, out_dim]
+
+        # Store edge-level quantities for interpretation.
+        self.att_weights = alpha.detach()
+        self.gate_values = gate.detach()
+        self.route_edge_index = edge_index.detach()
 
         return out
 
@@ -143,75 +199,192 @@ class SelfAttentionGlobalPool(nn.Module):
         return out
 
 
-class GlobalAttentionPool(nn.Module):
-    def __init__(self, hidden_dim, attention_dim=None, use_self_attention=True):
-        super().__init__()
-        if attention_dim is None:
-            attention_dim = hidden_dim
-        self.use_self_attention = use_self_attention
-        self.gated_attention = GatedAttentionLayer(hidden_dim)
-        self.att_pool = SelfAttentionGlobalPool(hidden_dim, attention_dim)
-        self.att_weights = None
 
-    def forward(self, x, edge_index, batch):
-        x = self.gated_attention(x, edge_index)  # [N, D]
-        gx = self.att_pool(x, batch)             # [B, D]
-        self.att_weights = (
-            self.att_pool.att_weights if self.use_self_attention
-            else self.gated_attention.att_weights
-        )
-        return gx
 
 
 
 
 
 class DMPNN(nn.Module):
-    def __init__(self, edge_dim, n_feats, n_iter):
+    def __init__(
+        self,
+        edge_dim,
+        n_feats,
+        n_iter,
+        route_dropout=0.1,
+        gate_hidden_dim=None,
+    ):
         super().__init__()
-        self.n_iter = n_iter
 
+        self.n_iter = n_iter
+        self.n_feats = n_feats
+
+        # Initial directed bond-state encoding.
         self.lin_u = nn.Linear(n_feats, n_feats, bias=False)
         self.lin_v = nn.Linear(n_feats, n_feats, bias=False)
         self.lin_edge = nn.Linear(edge_dim, n_feats, bias=False)
 
-        self.att = GlobalAttentionPool(n_feats)
-        self.a = nn.Parameter(torch.zeros(1, n_feats, n_iter))
-        self.lin_gout = nn.Linear(n_feats, n_feats)
-        self.a_bias = nn.Parameter(torch.zeros(1, 1, n_iter))
+        # True neighbor-specific selective message router.
+        self.route_conv = PairwiseGatedLineGraphConv(
+            in_dim=n_feats,
+            out_dim=n_feats,
+            att_dim=n_feats,
+            gate_hidden_dim=gate_hidden_dim,
+        )
 
+        # The selectively routed message enters the recurrent state update.
+        self.state_update = nn.GRUCell(
+            input_size=n_feats,
+            hidden_size=n_feats,
+        )
+
+        self.route_dropout = nn.Dropout(route_dropout)
+
+        # Use a separate normalization layer for each propagation iteration.
+        self.state_norms = nn.ModuleList(
+            [
+                nn.LayerNorm(n_feats)
+                for _ in range(n_iter)
+            ]
+        )
+
+        # Graph-level readout no longer performs another line-graph routing.
+        self.readout = SelfAttentionGlobalPool(
+            input_dim=n_feats,
+            hidden_dim=n_feats,
+        )
+
+        # Iteration-wise weighting.
+        self.a = nn.Parameter(
+            torch.zeros(1, n_feats, n_iter)
+        )
+        self.a_bias = nn.Parameter(
+            torch.zeros(1, 1, n_iter)
+        )
+
+        self.lin_gout = nn.Linear(n_feats, n_feats)
         glorot(self.a)
 
         self.lin_block = LinearBlock(n_feats)
 
+        # Saved for visualizing gates and attentions at every iteration.
+        self.route_gate_history = []
+        self.route_attention_history = []
+
     def forward(self, data):
         edge_index = data.edge_index
+        line_edge_index = data.line_graph_edge_index
+        bond_batch = data.edge_index_batch
+
+
         edge_u = self.lin_u(data.x)
         edge_v = self.lin_v(data.x)
         edge_uv = self.lin_edge(data.edge_attr)
-        edge_attr = (edge_u[edge_index[0]] + edge_v[edge_index[1]] + edge_uv) / 3
-        out = edge_attr
 
-        out_list = []
-        gout_list = []
-        for n in range(self.n_iter):
-            out = scatter(out[data.line_graph_edge_index[0]], data.line_graph_edge_index[1], dim_size=edge_attr.size(0),
-                          dim=0, reduce='add')
-            out = edge_attr + out
-            gout = self.att(out, data.line_graph_edge_index, data.edge_index_batch)
-            out_list.append(out)
-            gout_list.append(F.tanh((self.lin_gout(gout))))
+        edge_attr = (
+            edge_u[edge_index[0]]
+            + edge_v[edge_index[1]]
+            + edge_uv
+        ) / 3.0
 
-        gout_all = torch.stack(gout_list, dim=-1)
-        out_all = torch.stack(out_list, dim=-1)
-        scores = (gout_all * self.a).sum(1, keepdim=True) + self.a_bias
-        scores = torch.softmax(scores, dim=-1)
-        scores = scores.repeat_interleave(degree(data.edge_index_batch, dtype=data.edge_index_batch.dtype), dim=0)
-        out = (out_all * scores).sum(-1)
-        x = data.x + scatter(out, edge_index[1], dim_size=data.x.size(0), dim=0, reduce='add')
-        x = self.lin_block(x)
+        # h^(0)
+        state = edge_attr
 
-        return x
+        state_list = []
+        graph_state_list = []
+
+        self.route_gate_history = []
+        self.route_attention_history = []
+
+
+        for step in range(self.n_iter):
+            # Pair-conditioned, neighbor-specific routed message.
+            routed_message = self.route_conv(
+                state,
+                line_edge_index,
+            )
+
+
+            candidate = edge_attr + routed_message
+            candidate = self.route_dropout(candidate)
+
+ 
+            state = self.state_update(
+                candidate,
+                state,
+            )
+
+            state = self.state_norms[step](state)
+
+            state_list.append(state)
+
+            # Iteration-specific graph-level representation.
+            graph_state = self.readout(
+                state,
+                bond_batch,
+            )
+
+            graph_state = torch.tanh(
+                self.lin_gout(graph_state)
+            )
+
+            graph_state_list.append(graph_state)
+
+            # Save routing information for later visualization.
+            self.route_gate_history.append(
+                self.route_conv.gate_values
+            )
+            self.route_attention_history.append(
+                self.route_conv.att_weights
+            )
+
+
+        graph_state_all = torch.stack(
+            graph_state_list,
+            dim=-1,
+        )
+
+  
+        state_all = torch.stack(
+            state_list,
+            dim=-1,
+        )
+
+
+        iteration_scores = (
+            graph_state_all * self.a
+        ).sum(dim=1, keepdim=True) + self.a_bias
+
+        iteration_weights = torch.softmax(
+            iteration_scores,
+            dim=-1,
+        )  # [B, 1, K]
+
+
+        beta_edge = (
+            iteration_weights
+            .squeeze(1)[bond_batch]
+            .unsqueeze(1)
+        )
+
+        # Weighted multi-depth bond-state condensation.
+        state = (
+            state_all * beta_edge
+        ).sum(dim=-1)  # [E_bond, D]
+
+
+        incoming_bond_sum = scatter(
+            state,
+            edge_index[1],
+            dim=0,
+            dim_size=data.x.size(0),
+            reduce="sum",
+        )
+
+        atom_state = data.x + incoming_bond_sum
+        atom_state = self.lin_block(atom_state)
+
+        return atom_state
 
 
 class LinearBlock(nn.Module):
