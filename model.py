@@ -60,35 +60,69 @@ def exp(field):
     return func
 
 
-
 class GatedAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim=None):
         super(GatedAttentionLayer, self).__init__()
+
         if out_dim is None:
             out_dim = in_dim
 
         self.out_dim = out_dim
+
         self.query = nn.Linear(in_dim, out_dim)
         self.key = nn.Linear(in_dim, out_dim)
         self.value = nn.Linear(in_dim, out_dim)
         self.gate = nn.Linear(in_dim, 1)
+
         self.att_weights = None
 
     def forward(self, x, edge_index):
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-        gate_values = torch.sigmoid(self.gate(x))  # [N, 1]
+        # x: [N_line, in_dim]
+        q = self.query(x)       # [N_line, d_a]
+        k = self.key(x)         # [N_line, d_a]
+        v = self.value(x)       # [N_line, out_dim]
 
+        # Source-conditioned scalar gate.
+        gate_values = torch.sigmoid(self.gate(x))  # [N_line, 1]
+
+        # Each line-graph edge is src -> dst.
         src, dst = edge_index
-        att_scores = (q[src] * k[dst]).sum(dim=-1)  # [E]
-        gated_score = att_scores * gate_values[src].squeeze()  # [E]
 
-        att_weights = softmax(gated_score, src, num_nodes=x.size(0))  # [E]
+        # Scaled dot-product compatibility.
+        # d_a is the query/key dimensionality.
+        d_a = q.size(-1)
+        att_scores = (
+            (q[src] * k[dst]).sum(dim=-1) / (d_a ** 0.5)
+        )  # [E_line]
+
+        # Apply the source-conditioned gate before softmax.
+        gated_score = (
+            att_scores * gate_values[src].squeeze(-1)
+        )  # [E_line]
+
+        # Normalize over the outgoing neighbors of each fixed source.
+        att_weights = softmax(
+            gated_score,
+            src,
+            num_nodes=x.size(0)
+        )  # [E_line]
+
         self.att_weights = att_weights.detach()
 
-        out = torch.zeros(x.size(0), self.out_dim, device=x.device)
-        out = out.index_add_(0, src, att_weights.unsqueeze(-1) * v[dst])
+        # Aggregate destination values back to each source state.
+        out = torch.zeros(
+            x.size(0),
+            self.out_dim,
+            device=x.device,
+            dtype=v.dtype
+        )
+
+        out.index_add_(
+            0,
+            src,
+            att_weights.unsqueeze(-1) * v[dst]
+        )
+
         return out
 
 
