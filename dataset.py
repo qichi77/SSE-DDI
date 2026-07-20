@@ -1,132 +1,262 @@
-from torch_geometric.data import Batch, Data
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-from sklearn.model_selection import StratifiedShuffleSplit
-import pickle
-
-import torch
-import pickle
-
-import torch.utils.data
-import time
 import os
-import numpy as np
-
-import csv
+import pickle
+from pathlib import Path
 
 import dgl
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.data import Batch
+
+from utils import seed_worker
+
+
+REQUIRED_COLUMNS = {
+    'Drug1_ID',
+    'Drug2_ID',
+    'Y',
+    'label',
+}
 
 
 def read_pickle(filename):
-    with open(filename, 'rb') as f:
-        obj = pickle.load(f)
-    return obj
+    with open(filename, 'rb') as file:
+        return pickle.load(file)
 
 
 class DrugDataset(Dataset):
-    def __init__(self, data_df, drug_graph, drug_graph_dgl):
-        self.data_df = data_df
-        self.drug_graph = drug_graph
-        self.drug_graph_dgl = drug_graph_dgl
+    def __init__(
+        self,
+        data_df,
+        drug_graph,
+        drug_graph_dgl,
+    ):
+        missing_columns = REQUIRED_COLUMNS - set(data_df.columns)
+        if missing_columns:
+            raise ValueError(
+                f'Dataset is missing columns: {missing_columns}'
+            )
+
+        self.data_df = data_df.reset_index(drop=True).copy()
+
+     
+        self.data_df['Drug1_ID'] = (
+            self.data_df['Drug1_ID']
+            .astype(str)
+            .str.strip()
+        )
+        self.data_df['Drug2_ID'] = (
+            self.data_df['Drug2_ID']
+            .astype(str)
+            .str.strip()
+        )
+        self.data_df['Y'] = (
+            self.data_df['Y'].astype('int64')
+        )
+        self.data_df['label'] = (
+            self.data_df['label'].astype('float32')
+        )
+
+       
+        self.drug_graph = {
+            str(drug_id).strip(): graph
+            for drug_id, graph in drug_graph.items()
+        }
+        self.drug_graph_dgl = {
+            str(drug_id).strip(): graph
+            for drug_id, graph in drug_graph_dgl.items()
+        }
 
     def __len__(self):
         return len(self.data_df)
 
     def __getitem__(self, index):
-        return self.data_df.iloc[index]
+        row = self.data_df.iloc[index]
+
+        return {
+            'Drug1_ID': row['Drug1_ID'],
+            'Drug2_ID': row['Drug2_ID'],
+            'Y': int(row['Y']),
+            'label': float(row['label']),
+        }
 
     def collate_fn(self, batch):
-        head_list = []
-        head_list_dgl = []
-        tail_list = []
-        tail_list_dgl = []
-        label_list = []
-        rel_list = []
+        head_graphs = []
+        tail_graphs = []
+        head_dgl_graphs = []
+        tail_dgl_graphs = []
+        relations = []
+        labels = []
 
         for row in batch:
-            Drug1_ID, Drug2_ID, Y, Neg_samples = row['Drug1_ID'], row['Drug2_ID'], row['Y'], row['Neg samples']
-            Neg_ID, Ntype = Neg_samples.split('$')
-            h_graph = self.drug_graph.get(Drug1_ID)
-            t_graph = self.drug_graph.get(Drug2_ID)
-            n_graph = self.drug_graph.get(Neg_ID)
-            h_graph_dgl = self.drug_graph_dgl.get(Drug1_ID)
-            t_graph_dgl = self.drug_graph_dgl.get(Drug2_ID)
-            n_graph_dgl = self.drug_graph_dgl.get(Neg_ID)
+            head_id = str(row['Drug1_ID'])
+            tail_id = str(row['Drug2_ID'])
 
-            pos_pair_h = h_graph
-            pos_pair_t = t_graph
-            pos_pair_h_dgl = h_graph_dgl
-            pos_pair_t_dgl = t_graph_dgl
+            head_graph = self.drug_graph.get(head_id)
+            tail_graph = self.drug_graph.get(tail_id)
 
-            if Ntype == 'h':
-                neg_pair_h = n_graph
-                neg_pair_t = t_graph
-                neg_pair_h_dgl = n_graph_dgl
-                neg_pair_t_dgl = t_graph_dgl
-            else:
-                neg_pair_h = h_graph
-                neg_pair_t = n_graph
-                neg_pair_h_dgl = h_graph_dgl
-                neg_pair_t_dgl = n_graph_dgl
+            head_dgl_graph = self.drug_graph_dgl.get(head_id)
+            tail_dgl_graph = self.drug_graph_dgl.get(tail_id)
 
-            head_list.append(pos_pair_h)
-            head_list.append(neg_pair_h)
-            head_list_dgl.append(pos_pair_h_dgl)
-            head_list_dgl.append(neg_pair_h_dgl)
-            tail_list.append(pos_pair_t)
-            tail_list.append(neg_pair_t)
-            tail_list_dgl.append(pos_pair_t_dgl)
-            tail_list_dgl.append(neg_pair_t_dgl)
+            if head_graph is None:
+                raise KeyError(
+                    f'No PyG molecular graph for drug {head_id}.'
+                )
+            if tail_graph is None:
+                raise KeyError(
+                    f'No PyG molecular graph for drug {tail_id}.'
+                )
+            if head_dgl_graph is None:
+                raise KeyError(
+                    f'No DGL molecular graph for drug {head_id}.'
+                )
+            if tail_dgl_graph is None:
+                raise KeyError(
+                    f'No DGL molecular graph for drug {tail_id}.'
+                )
 
-            rel_list.append(torch.LongTensor([Y]))
-            rel_list.append(torch.LongTensor([Y]))
+            head_graphs.append(head_graph)
+            tail_graphs.append(tail_graph)
+            head_dgl_graphs.append(head_dgl_graph)
+            tail_dgl_graphs.append(tail_dgl_graph)
 
-            label_list.append(torch.FloatTensor([1]))
-            label_list.append(torch.FloatTensor([0]))
+            relations.append(int(row['Y']))
+            labels.append(float(row['label']))
 
-        head_pairs = Batch.from_data_list(head_list, follow_batch=['edge_index'])
-        tail_pairs = Batch.from_data_list(tail_list, follow_batch=['edge_index'])
-        head_pairs_dgl = dgl.batch(head_list_dgl)
-        tail_pairs_dgl = dgl.batch(tail_list_dgl)
-        rel = torch.cat(rel_list, dim=0)
-        label = torch.cat(label_list, dim=0)
+        head_batch = Batch.from_data_list(
+            head_graphs,
+            follow_batch=['edge_index'],
+        )
+        tail_batch = Batch.from_data_list(
+            tail_graphs,
+            follow_batch=['edge_index'],
+        )
 
-        return head_pairs, tail_pairs, head_pairs_dgl, tail_pairs_dgl, rel, label
+        head_dgl_batch = dgl.batch(head_dgl_graphs)
+        tail_dgl_batch = dgl.batch(tail_dgl_graphs)
+
+        relation_tensor = torch.tensor(
+            relations,
+            dtype=torch.long,
+        )
+        label_tensor = torch.tensor(
+            labels,
+            dtype=torch.float32,
+        )
+
+        return (
+            head_batch,
+            tail_batch,
+            head_dgl_batch,
+            tail_dgl_batch,
+            relation_tensor,
+            label_tensor,
+        )
 
 
 class DrugDataLoader(DataLoader):
-    def __init__(self, data, **kwargs):
-        super().__init__(data, collate_fn=data.collate_fn, **kwargs)
+    def __init__(self, dataset, **kwargs):
+        super().__init__(
+            dataset,
+            collate_fn=dataset.collate_fn,
+            **kwargs,
+        )
 
 
-def split_train_valid(data_df, fold, val_ratio=0.2):
-    cv_split = StratifiedShuffleSplit(n_splits=2, test_size=val_ratio, random_state=fold)
-    train_index, val_index = next(iter(cv_split.split(X=range(len(data_df)), y=data_df['Y'])))
+def build_loader(
+    dataframe,
+    drug_graph,
+    drug_graph_dgl,
+    batch_size,
+    shuffle,
+    num_workers,
+    seed,
+):
+    dataset = DrugDataset(
+        data_df=dataframe,
+        drug_graph=drug_graph,
+        drug_graph_dgl=drug_graph_dgl,
+    )
 
-    train_df = data_df.iloc[train_index]
-    val_df = data_df.iloc[val_index]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
 
-    return train_df, val_df
+    return DrugDataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=generator,
+        persistent_workers=(num_workers > 0),
+    )
 
 
-def load_ddi_dataset(root, batch_size, fold=0):
-    drug_graph = read_pickle(os.path.join(root, 'drug_data_pyg.pkl'))
-    drug_graph_dgl = read_pickle(os.path.join(root, 'drug_data_dgl.pkl'))
+def load_ddi_dataset(
+    root,
+    batch_size,
+    mode,
+    seed,
+    num_workers=0,
+):
+  
+    root = Path(root)
 
-    train_df = pd.read_csv(os.path.join(root, f'pair_pos_neg_triplets_train_fold{fold}.csv'))
-    test_df = pd.read_csv(os.path.join(root, f'pair_pos_neg_triplets_test_fold{fold}.csv'))
-    train_df, val_df = split_train_valid(train_df, fold=fold)
+    drug_graph_file = root / 'drug_data_pyg.pkl'
+    drug_graph_dgl_file = root / 'drug_data_dgl.pkl'
 
-    train_set = DrugDataset(train_df, drug_graph, drug_graph_dgl)
-    val_set = DrugDataset(val_df, drug_graph, drug_graph_dgl)
-    test_set = DrugDataset(test_df, drug_graph, drug_graph_dgl)
-    train_loader = DrugDataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True)
-    val_loader = DrugDataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=8)
-    test_loader = DrugDataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=8)
+    if not drug_graph_file.exists():
+        raise FileNotFoundError(drug_graph_file)
+    if not drug_graph_dgl_file.exists():
+        raise FileNotFoundError(drug_graph_dgl_file)
 
-    print("Number of samples in the train set: ", len(train_set))
-    print("Number of samples in the validation set: ", len(val_set))
-    print("Number of samples in the test set: ", len(test_set))
+    drug_graph = read_pickle(drug_graph_file)
+    drug_graph_dgl = read_pickle(drug_graph_dgl_file)
 
-    return train_loader, val_loader, test_loader
+    if mode == 'transductive':
+        split_names = ['train', 'val', 'test']
+    elif mode == 'inductive':
+        split_names = ['train', 'val', 's1', 's2']
+    else:
+        raise ValueError(
+            f'Unsupported evaluation mode: {mode}'
+        )
 
+    loaders = {}
+
+    for split_name in split_names:
+        csv_file = (
+            root
+            / f'{mode}_seed{seed}_{split_name}.csv'
+        )
+        if not csv_file.exists():
+            raise FileNotFoundError(
+                f'{csv_file} does not exist. '
+                'Generate this split with data_pre.py first.'
+            )
+
+        dataframe = pd.read_csv(
+            csv_file,
+            dtype={
+                'Drug1_ID': str,
+                'Drug2_ID': str,
+            },
+        )
+
+        loaders[split_name] = build_loader(
+            dataframe=dataframe,
+            drug_graph=drug_graph,
+            drug_graph_dgl=drug_graph_dgl,
+            batch_size=batch_size,
+            shuffle=(split_name == 'train'),
+            num_workers=num_workers,
+            seed=seed,
+        )
+
+        print(
+            f'{mode}/{split_name}: '
+            f'{len(loaders[split_name].dataset)} instances'
+        )
+
+    return loaders
