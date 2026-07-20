@@ -1,18 +1,95 @@
 # SSE-DDI
 
-SSE-DDI is a molecular structure-driven framework for relation-conditioned drug–drug interaction prediction.
+**Selective Substructure Encoding with Bond-Centered Molecular Representations for Drug–Drug Interaction Prediction**
 
-The implementation uses:
+SSE-DDI is a molecular structure-driven framework for drug–drug interaction prediction. It represents each molecule with directed bond states, performs non-backtracking substructure encoding, and combines molecular representations with SMILES-derived structural similarity profiles.
 
-1. SMILES-derived molecular graphs;
-2. directed bond-state line graphs;
-3. Substructure-Selective Encoding;
-4. Edge-Fusion Graph Transformer;
-5. Morgan-fingerprint structural similarity profiles.
 
-No target, enzyme, pathway, side-effect, or DDI-label-derived interaction profile is used as an input feature.
+## Overview
 
-## Project structure
+Given a drug pair and a candidate interaction type, SSE-DDI predicts whether the interaction is present.
+
+The released pipeline includes:
+
+- molecular graph construction from SMILES;
+- directed bond-state and non-backtracking line-graph preprocessing;
+- Morgan-fingerprint Tanimoto similarity profiles;
+- transductive and inductive data splits;
+- fixed 1:1 positive/negative sampling;
+- training and evaluation over five random seeds;
+- ACC, AUC, F1, precision, recall, and AP reporting;
+- reproducibility checks and metadata export.
+
+Supported datasets:
+
+- **DrugBank**
+- **TwoSIDES**
+
+---
+
+## Method highlights
+
+### Bond-centered molecular representation
+
+Each undirected chemical bond is expanded into two directed bond states:
+
+```text
+u -> v
+v -> u
+```
+
+The directed line graph allows transitions of the form:
+
+```text
+(u, v) -> (v, w)
+```
+
+subject to:
+
+```text
+w != u
+```
+
+This prevents immediate backtracking and supports directional substructure propagation.
+
+### Structural similarity profile
+
+For each drug, the preprocessing pipeline computes a Morgan fingerprint and its Tanimoto similarity to all drugs in the benchmark dictionary.
+
+The refined similarity graph applies:
+
+1. Top-K candidate selection;
+2. adaptive thresholding;
+3. minimum-degree backfilling;
+4. Mutual-KNN filtering;
+5. maximum-degree capping;
+6. a second backfilling step.
+
+The adaptive threshold is:
+
+```text
+tau = max(tau_q, tau_mu)
+```
+
+where:
+
+```text
+tau_mu = mean + lambda * population_standard_deviation
+```
+
+### Transductive and inductive evaluation
+
+The repository supports:
+
+- **Transductive:** positive triplets are split into 60% train, 20% validation, and 20% test.
+- **Inductive S1:** exactly one drug in the pair is unseen during training.
+- **Inductive S2:** both drugs are unseen during training.
+
+Unseen drugs remain available through their SMILES-derived molecular structures and similarity profiles.
+
+---
+
+## Repository structure
 
 ```text
 SSE-DDI/
@@ -22,48 +99,53 @@ SSE-DDI/
 ├── train.py
 ├── metrics.py
 ├── utils.py
-├── run_experiments.py
-├── requirements.txt
 ├── README.md
+├── README_zh-CN.md
 ├── data/
 │   ├── raw/
 │   │   ├── drugbank.tab
 │   │   └── twosides.csv
 │   └── processed/
-│       ├── drugbank/
-│       └── twosides/
 ├── checkpoints/
 └── results/
 ```
 
-## Requirements
+> `data_pre.py` must keep this filename because serialized PyG objects use `CustomData` from that module.
 
-Install dependencies with:
+---
+
+## Installation
+
+The project requires compatible versions of:
+
+- Python
+- PyTorch
+- PyTorch Geometric
+- DGL
+- RDKit
+- NumPy
+- pandas
+- SciPy
+- scikit-learn
+- tqdm
+
+Install PyTorch, PyTorch Geometric, and DGL according to the local CUDA or CPU environment. Then install the remaining dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install numpy pandas scipy scikit-learn tqdm rdkit
 ```
 
-The exact package versions used to produce the reported results should be recorded before the public release.
+For an exact reproducibility record, export the final environment after the project runs successfully:
 
-A typical `requirements.txt` should include:
-
-```text
-numpy
-pandas
-scipy
-scikit-learn
-tqdm
-rdkit
-torch
-torch-geometric
-torch-scatter
-dgl
+```bash
+pip freeze > requirements-lock.txt
 ```
 
-## Raw datasets
+---
 
-Recommended paths:
+## Data format
+
+Place the raw files under:
 
 ```text
 data/raw/drugbank.tab
@@ -72,126 +154,46 @@ data/raw/twosides.csv
 
 ### DrugBank default columns
 
-```text
-ID1
-ID2
-X1
-X2
-Y
-```
+| Field | Column |
+|---|---|
+| Head drug ID | `ID1` |
+| Tail drug ID | `ID2` |
+| Head SMILES | `X1` |
+| Tail SMILES | `X2` |
+| Relation label | `Y` |
+
+The default separator is a tab.
 
 ### TwoSIDES default columns
 
-```text
-Drug1_ID
-Drug2_ID
-Drug1
-Drug2
-New Y
-```
+| Field | Column |
+|---|---|
+| Head drug ID | `Drug1_ID` |
+| Tail drug ID | `Drug2_ID` |
+| Head SMILES | `Drug1` |
+| Tail SMILES | `Drug2` |
+| Relation label | `New Y` |
 
-Column names can be overridden through the command-line arguments of `data_pre.py`.
+The default separator is a comma.
 
-## Processed data format
-
-Each processed binary-classification CSV uses the following columns:
+Custom columns can be specified with:
 
 ```text
-Drug1_ID,Drug2_ID,Y,label
-DB00001,DB00002,5,1
-DB00001,DB00125,5,0
+--head-id-col
+--tail-id-col
+--head-smiles-col
+--tail-smiles-col
+--relation-col
+--delimiter
 ```
 
-Definitions:
+---
 
-- `Drug1_ID`: head drug identifier;
-- `Drug2_ID`: tail drug identifier;
-- `Y`: zero-based relation identifier;
-- `label`: binary interaction label, where `1` is positive and `0` is negative.
+## Quick start
 
-The preprocessing pipeline also generates:
+### 1. Build molecular graphs and similarity profiles
 
-```text
-drug_data_pyg.pkl
-drug_data_dgl.pkl
-relation_map.json
-dataset_meta.json
-split_meta_<mode>_seed<seed>.json
-```
-
-## Experimental protocols
-
-### Transductive setting
-
-Positive DDI triplets are randomly divided into:
-
-- 60% training;
-- 20% validation;
-- 20% test.
-
-All drug entities may occur in multiple splits, but the same positive drug–drug–relation triplet cannot occur in more than one split.
-
-This setting evaluates prediction of new interaction triplets among observed drugs.
-
-### Inductive setting
-
-Twenty percent of drugs are randomly held out as unseen entities.
-
-The resulting subsets are:
-
-- `train`: seen–seen drug pairs only;
-- `val`: seen–seen drug pairs only;
-- `S1`: exactly one seen drug and one unseen drug;
-- `S2`: two unseen drugs.
-
-Twenty percent of the seen–seen positive triplets are used as the validation set.
-
-Unseen drugs are excluded from training interaction triplets, but their SMILES-derived molecular structures remain available during inference.
-
-### Negative sampling
-
-For every positive triplet, one negative triplet is generated by randomly replacing the head drug or tail drug while keeping the relation type unchanged.
-
-A generated negative triplet is rejected when:
-
-1. it occurs in the complete known-positive triplet set;
-2. it duplicates a previously generated negative triplet;
-3. it becomes a drug self-pair;
-4. it violates the required inductive scenario.
-
-The positive-to-negative ratio is fixed at `1:1`.
-
-For inductive evaluation:
-
-- training and validation negatives use seen drugs only;
-- S1 negatives preserve the seen/unseen status of each drug position;
-- S2 negatives use unseen drugs only.
-
-## Repeated experiments
-
-Each experiment is independently run using five random seeds:
-
-```text
-0
-1
-2
-3
-4
-```
-
-Results are reported as:
-
-```text
-mean ± sample standard deviation
-```
-
-## Data preparation
-
-### 1. Generate molecular graphs and similarity profiles
-
-This step only needs to be executed once for each dataset.
-
-#### DrugBank
+DrugBank:
 
 ```bash
 python data_pre.py \
@@ -201,7 +203,7 @@ python data_pre.py \
   --operation drug_data
 ```
 
-#### TwoSIDES
+TwoSIDES:
 
 ```bash
 python data_pre.py \
@@ -211,273 +213,132 @@ python data_pre.py \
   --operation drug_data
 ```
 
-### 2. Generate one transductive split
+This step only needs to be run once per dataset.
+
+### 2. Generate five split seeds
+
+DrugBank:
 
 ```bash
-python data_pre.py \
-  --dataset drugbank \
-  --raw-file ./data/raw/drugbank.tab \
-  --output-root ./data/processed \
-  --operation split \
-  --mode transductive \
-  --seed 0
+for seed in 0 1 2 3 4; do
+  python data_pre.py \
+    --dataset drugbank \
+    --raw-file ./data/raw/drugbank.tab \
+    --output-root ./data/processed \
+    --operation split \
+    --mode both \
+    --seed "$seed"
+done
 ```
 
-Generated files include:
-
-```text
-transductive_seed0_train.csv
-transductive_seed0_val.csv
-transductive_seed0_test.csv
-split_meta_transductive_seed0.json
-```
-
-### 3. Generate one inductive split
+TwoSIDES:
 
 ```bash
-python data_pre.py \
-  --dataset drugbank \
-  --raw-file ./data/raw/drugbank.tab \
-  --output-root ./data/processed \
-  --operation split \
-  --mode inductive \
-  --seed 0 \
-  --unseen-ratio 0.20
+for seed in 0 1 2 3 4; do
+  python data_pre.py \
+    --dataset twosides \
+    --raw-file ./data/raw/twosides.csv \
+    --output-root ./data/processed \
+    --operation split \
+    --mode both \
+    --seed "$seed"
+done
 ```
 
-Generated files include:
+Use one of the following to generate a single protocol:
 
 ```text
-inductive_seed0_train.csv
-inductive_seed0_val.csv
-inductive_seed0_s1.csv
-inductive_seed0_s2.csv
-inductive_seed0_unseen_drugs.txt
-split_meta_inductive_seed0.json
+--mode transductive
+--mode inductive
 ```
 
-## Hyperparameters
+### 3. Train and evaluate
 
-### Default transductive configuration
-
-| Hyperparameter | Value |
-|---|---:|
-| Batch size | 256 |
-| Initial learning rate | `1e-4` |
-| Weight decay | `1e-3` |
-| Dropout | 0.2 |
-| Learning-rate decay factor | 0.98 |
-| Hidden dimension | 96 |
-| Attention heads | 6 |
-| SSE iterations | 8 |
-| Graph Transformer layers | 2 |
-
-### Inductive configuration
-
-The inductive experiments use the following adjusted parameters:
-
-| Hyperparameter | Value |
-|---|---:|
-| Initial learning rate | `2e-5` |
-| SSE iterations | 6 |
-
-All other parameters remain unchanged unless explicitly specified.
-
-## Training
-
-### Train one transductive run
+Five transductive runs:
 
 ```bash
 python train.py \
   --dataset drugbank \
   --mode transductive \
-  --seed 0 \
+  --seeds 0 1 2 3 4 \
   --data-root ./data/processed \
   --result-root ./results \
   --checkpoint-root ./checkpoints
 ```
 
-### Train one inductive run
+Five inductive runs:
 
 ```bash
 python train.py \
   --dataset drugbank \
   --mode inductive \
-  --seed 0 \
+  --seeds 0 1 2 3 4 \
   --data-root ./data/processed \
   --result-root ./results \
   --checkpoint-root ./checkpoints
 ```
 
-The checkpoint with the highest validation AUC is used for final evaluation.
+Replace `drugbank` with `twosides` for TwoSIDES.
 
-For transductive evaluation, the selected checkpoint is evaluated on `test`.
+### Single-seed debugging
 
-For inductive evaluation, the selected checkpoint is independently evaluated on `S1` and `S2`.
-
-## Run five seeds
-
-### DrugBank transductive experiment
+Strict paper mode requires exactly five seeds. For a one-seed debugging run:
 
 ```bash
-python run_experiments.py \
+python train.py \
   --dataset drugbank \
   --mode transductive \
-  --raw-file ./data/raw/drugbank.tab
+  --seeds 0 \
+  --no-strict-paper-hparams
 ```
 
-### DrugBank inductive experiment
+Single-seed results should not be mixed with the reported five-run results.
 
-If molecular graphs and similarity profiles have already been generated:
+---
 
-```bash
-python run_experiments.py \
-  --dataset drugbank \
-  --mode inductive \
-  --raw-file ./data/raw/drugbank.tab \
-  --skip-drug-data
-```
 
-### TwoSIDES transductive experiment
 
-```bash
-python run_experiments.py \
-  --dataset twosides \
-  --mode transductive \
-  --raw-file ./data/raw/twosides.csv
-```
 
-## Outputs
+## Model interface
 
-Checkpoints are saved under:
-
-```text
-checkpoints/<dataset>/<mode>/seed<seed>_best.pt
-```
-
-Per-seed results are saved under:
-
-```text
-results/<dataset>/<mode>/seed<seed>.json
-```
-
-The five-seed summary is saved under:
-
-```text
-results/<dataset>/<mode>/summary.json
-```
-
-A summary contains:
-
-- ACC;
-- AUC;
-- F1;
-- precision;
-- recall;
-- AP;
-- mean across five seeds;
-- sample standard deviation across five seeds;
-- individual seed values.
-
-## Dataset metadata
-
-`dataset_meta.json` records:
-
-- dataset name;
-- raw dataset path;
-- number of valid positive triplets;
-- number of drugs occurring in valid triplets;
-- similarity input dimension;
-- number of relation types;
-- raw column definitions;
-- Morgan fingerprint radius;
-- similarity top-k value;
-- similarity threshold formula
-  `max(quantile, mean + lambda × standard deviation)`;
-- similarity quantile, default `0.70`;
-- statistical threshold coefficient `lambda`,
-  default `0.50`;
-- minimum and maximum refined graph degrees.
-
-The reported dataset statistics in the paper should be taken from this processed metadata rather than from the complete external database.
-## Validate generated splits
-
-```bash
-python validate_splits.py \
-  --dataset drugbank \
-  --mode transductive \
-  --seed 0
-python validate_splits.py \
-  --dataset drugbank \
-  --mode inductive \
-  --seed 0
-
-## Final-iteration SSE attention visualization
-
-```bash
-python visualize_attention_cli.py \
-  --dataset drugbank \
-  --mode transductive \
-  --split test \
-  --seed 0 \
-  --checkpoint checkpoints/drugbank/transductive/seed0_best.pt \
-  --correct-positive-only \
-  --num-samples 10
-## Reproducibility checks
-
-Before training, check Python syntax:
-
-```bash
-python -m py_compile \
-  data_pre.py \
-  dataset.py \
-  model.py \
-  metrics.py \
-  utils.py \
-  train.py \
-  run_experiments.py
-```
-
-Check the positive-to-negative ratio:
+The training script constructs the model with:
 
 ```python
-import pandas as pd
-
-root = "./data/processed/drugbank"
-
-train = pd.read_csv(
-    f"{root}/transductive_seed0_train.csv"
-)
-val = pd.read_csv(
-    f"{root}/transductive_seed0_val.csv"
-)
-test = pd.read_csv(
-    f"{root}/transductive_seed0_test.csv"
-)
-
-for name, data in [
-    ("train", train),
-    ("val", val),
-    ("test", test),
-]:
-    positive = int(data["label"].sum())
-    negative = int((data["label"] == 0).sum())
-
-    print(name, len(data), positive, negative)
-
-    assert positive == negative
-    assert data["Y"].min() >= 0
+model = gnn_model("GraphTransformer", net_params)
 ```
 
-For inductive splits, additionally verify:
+The model must accept dynamic values for:
 
-- no unseen drug occurs in the training set;
-- every S1 triplet contains exactly one unseen drug;
-- every S2 triplet contains two unseen drugs;
-- positive triplets are mutually disjoint across splits;
-- generated negative triplets do not occur in the complete positive set.
+```text
+num_relations
+sim_dim
+similarity_dim
+n_iter
+L
+n_heads
+hidden_dim
+num_atom_type
+num_bond_type
+```
 
-The released implementation is intended to match the experimental
-protocol described in the manuscript. All manuscript results must be
-regenerated from the released scripts, validated splits, configurations,
-and checkpoints before the repository is declared fully reproducible.
+The expected forward call is:
+
+```python
+logits = model(
+    head_pyg,
+    tail_pyg,
+    head_dgl,
+    tail_dgl,
+    head_dgl.edata["feat"],
+    tail_dgl.edata["feat"],
+    relation,
+    head_pyg.sim,
+    tail_pyg.sim,
+)
+```
+
+The output must contain one logit per DDI instance.
+
+---
+
+
